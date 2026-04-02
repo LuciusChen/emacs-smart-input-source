@@ -454,14 +454,20 @@ SOURCE should be \\='english or \\='other."
   (sis--get)
   (message (sis--normalize-to-source sis--current)))
 
-(defsubst sis--save-to-buffer ()
-  "Save buffer input source."
-  (sis--get))
+(defsubst sis--save-to-buffer (&optional buffer)
+  "Save BUFFER input source.
 
-(defsubst sis--restore-from-buffer ()
-  "Restore buffer input source."
-  (setq sis--for-buffer-locked nil)
-  (sis--set (or sis--for-buffer 'english)))
+BUFFER defaults to the current buffer."
+  (with-current-buffer (or buffer (current-buffer))
+    (sis--get)))
+
+(defsubst sis--restore-from-buffer (&optional buffer)
+  "Restore BUFFER input source.
+
+BUFFER defaults to the current buffer."
+  (with-current-buffer (or buffer (current-buffer))
+    (setq sis--for-buffer-locked nil)
+    (sis--set (or sis--for-buffer 'english))))
 
 (defun sis--set-english ()
   "Function to set input source to \\='english."
@@ -719,19 +725,16 @@ way."
 ;; Following codes are mainly about respect mode
 ;;
 
-(defvar sis--prefix-override-map-alist nil
-  "Map alist for override.")
+(defvar sis--prefix-override-saved-bindings nil
+  "Saved input-decode bindings replaced by respect mode.")
 
 (defvar sis--prefix-handle-stage 'normal
   "Processing state of the prefix key.
 
-Possible values: \\='normal, \\='prefix, \\='sequence.")
-
-(defvar sis--buffer-before-prefix nil
-  "Current buffer before prefix.")
+Possible values: \\='normal, \\='sequence.")
 
 (defvar sis--buffer-before-command nil
-  "Current buffer before prefix.")
+  "Tracked buffer before the current command.")
 
 (defvar sis--real-this-command nil
   "Real this command. Some commands overwrite it.")
@@ -745,27 +748,39 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
 (defvar sis--respect-force-restore nil
   "Force restore after command finishes.")
 
-(defvar sis--prefix-override-order -1000
-  "Order of the prefix override in `emulation-mode-map-alists'.")
+(defun sis--respect-tracked-buffer ()
+  "Return the buffer that currently owns respect-mode state."
+  (let ((window (cond
+                 ((and (active-minibuffer-window)
+                       (window-live-p (minibuffer-selected-window)))
+                  (minibuffer-selected-window))
+                 ((window-live-p (selected-window))
+                  (selected-window)))))
+    (or (and window (window-buffer window))
+        (current-buffer))))
 
 (defun sis--respect-go-english-advice (&rest _)
   "Advice for `sis-respect-go-english-triggers'."
-  (sis--save-to-buffer)
-  (when sis-log-mode
-    (message "go-english-advice: %s@%s, %s@locked"
-             sis--for-buffer (current-buffer)
-             sis--for-buffer-locked))
-  (setq sis--for-buffer-locked t)
-  (sis--set-english)
-  (setq sis--respect-go-english t))
+  (let ((buffer (sis--respect-tracked-buffer)))
+    (with-current-buffer buffer
+      (sis--save-to-buffer buffer)
+      (when sis-log-mode
+        (message "go-english-advice: %s@%s, %s@locked"
+                 sis--for-buffer buffer
+                 sis--for-buffer-locked))
+      (setq sis--for-buffer-locked t)
+      (sis--set-english))
+    (setq sis--respect-go-english t)))
 
 (defun sis--respect-restore-advice (fn &rest args)
   "Advice for FN in `sis-respect-restore-triggers' with ARGS args."
   (unwind-protect (apply fn args)
-    (when sis-log-mode
-      (message "restore-advice: %s@%s, %s@locked"
-               sis--for-buffer (current-buffer)
-               sis--for-buffer-locked))
+    (let ((buffer (sis--respect-tracked-buffer)))
+      (when sis-log-mode
+        (with-current-buffer buffer
+          (message "restore-advice: %s@%s, %s@locked"
+                   sis--for-buffer buffer
+                   sis--for-buffer-locked))))
     (setq sis--respect-go-english nil)
     (setq sis--respect-force-restore t)))
 
@@ -786,102 +801,6 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
   (interactive)
   (when (local-variable-p 'sis--prefix-override-map-enable)
     (kill-local-variable 'sis--prefix-override-map-enable)))
-
-(defun sis--prefix-override-recap-do ()
-  "Recap prefix key override."
-  (add-to-ordered-list
-   'emulation-mode-map-alists
-   'sis--prefix-override-map-alist
-   sis--prefix-override-order))
-
-(defun sis--prefix-override-recap-advice (fn &rest args)
-  "Advice for FN of `prefix-override-recap-triggers' with ARGS."
-  (unwind-protect (apply fn args)
-    (sis--prefix-override-recap-do)))
-
-(defun sis--prefix-override-handler (arg)
-  "Prefix key handler with ARG."
-  (interactive "P")
-  ;; Restore the prefix arg
-  (setq prefix-arg arg)
-  (prefix-command-preserve-state)
-  ;; Push the key back on the event queue
-  (setq unread-command-events
-        (append (mapcar (lambda (e) (cons t e))
-                        (listify-key-sequence (this-command-keys)))
-                unread-command-events)))
-
-(defun sis--respect-focus-change-advice ()
-  "Advice for `after-focus-change-function'."
-  (if (frame-focus-state)
-      (sis--respect-focus-in-handler)
-    (sis--respect-focus-out-handler)))
-
-(defun sis--respect-focus-out-handler ()
-  "Handler for `focus-out-hook'."
-
-  ;; `mouse-drag-region' causes lots of noise.
-  (unless (eq this-command 'mouse-drag-region)
-    ;; can't use `sis--save-to-buffer' directly
-    ;; because OS may has already changed input source
-    ;; when other windows get focus.
-    ;; so, don't get the current OS input source
-    (setq sis--for-buffer-locked t)
-    (sis--set-english))
-
-  (when sis-log-mode
-    (message "Handle save hook, save [%s] to [%s]."
-             sis--for-buffer (current-buffer))))
-
-(defun sis--respect-focus-in-handler ()
-  "Handler for `focus-in-hook'."
-  (when sis-log-mode
-    (message "Handle restore hook, restore [%s] from [%s] ."
-             sis--for-buffer (current-buffer)))
-  (sis--restore-from-buffer))
-
-(defun sis--respect-pre-command-handler ()
-  "Handler for `pre-command-hook' to preserve input source."
-  (setq sis--buffer-before-command (current-buffer))
-  (setq sis--real-this-command this-command)
-  (when sis-log-mode
-    (message "pre@[%s]: [%s]@key [%s]@cmd [%s]@buf [%s]@override."
-             sis--prefix-handle-stage
-             (this-command-keys)
-             sis--real-this-command
-             (current-buffer)
-             sis--prefix-override-map-enable))
-
-  (pcase sis--prefix-handle-stage
-    ;; current is normal stage
-    ('normal
-     (cond
-      ;; not prefix key
-      ((not (eq sis--real-this-command #'sis--prefix-override-handler))
-       t)
-
-      ;; for prefix key
-      ((eq sis--real-this-command #'sis--prefix-override-handler)
-
-       ;; go to pre@[prefix] directly
-       (when sis-log-mode
-         (message
-          "[%s] is a prefix key, short circuit to prefix phase."
-          (this-command-keys)))
-       (setq sis--prefix-handle-stage 'prefix)
-       (sis--respect-pre-command-handler))))
-    ;; current is prefix stage
-    ('prefix
-     (setq sis--prefix-override-map-enable nil)
-     (setq sis--buffer-before-prefix (current-buffer))
-     (sis--save-to-buffer)
-     (setq sis--for-buffer-locked t)
-     (sis--set-english)
-     (when sis-log-mode
-       (message "Input source: [%s] (saved) => [%s]."
-                sis--for-buffer sis-english-source)))
-    ;; current is sequence stage
-    ('sequence t)))
 
 (defvar sis-prefix-override-buffer-disable-predicates
   (list 'minibufferp
@@ -908,44 +827,148 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
       (setq value (or value (funcall p))))
     value))
 
-(defun sis--respect-post-cmd-timer-fn ()
-  "Function for `sis--respect-post-cmd-timer'."
+(defun sis--prefix-override-enabled-p (&optional buffer)
+  "Return non-nil when prefix override is enabled in BUFFER.
+
+BUFFER defaults to the current buffer."
+  (with-current-buffer (or buffer (current-buffer))
+    (when (and (not (local-variable-p 'sis--prefix-override-map-enable))
+               (sis--prefix-override-buffer-disable-p))
+      (sis-prefix-override-buffer-disable))
+    sis--prefix-override-map-enable))
+
+(defun sis--prefix-override-begin (buffer)
+  "Prepare respect mode for a prefix key in BUFFER."
+  (unless (eq sis--prefix-handle-stage 'sequence)
+    (setq sis--prefix-handle-stage 'sequence)
+    (with-current-buffer buffer
+      (sis--save-to-buffer buffer)
+      (setq sis--for-buffer-locked t)
+      (sis--set-english)
+      (when sis-log-mode
+        (message "Input source: [%s] (saved) => [%s]."
+                 sis--for-buffer sis-english-source)))))
+
+(defun sis--prefix-override-make-translation (key)
+  "Return an input-decode translation for KEY."
+  (lambda (&optional _prompt)
+    (let ((buffer (sis--respect-tracked-buffer)))
+      (when (and sis-global-respect-mode
+                 sis-respect-prefix-and-buffer
+                 (buffer-live-p buffer)
+                 (sis--prefix-override-enabled-p buffer))
+        (sis--prefix-override-begin buffer)))
+    (vconcat key)))
+
+(defun sis--prefix-override-install (&optional refresh)
+  "Install prefix override translations.
+
+When REFRESH is non-nil, restore and reinstall the bindings."
+  (when refresh
+    (dolist (entry sis--prefix-override-saved-bindings)
+      (define-key input-decode-map (car entry) (cdr entry)))
+    (setq sis--prefix-override-saved-bindings nil))
+  (unless sis--prefix-override-saved-bindings
+    (dolist (prefix sis-prefix-override-keys)
+      (let* ((key (kbd prefix))
+             (binding (lookup-key input-decode-map key)))
+        (push (cons key (unless (numberp binding) binding))
+              sis--prefix-override-saved-bindings)
+        (define-key input-decode-map key
+          (sis--prefix-override-make-translation key))))))
+
+(defun sis--prefix-override-uninstall ()
+  "Restore input-decode bindings replaced by respect mode."
+  (dolist (entry sis--prefix-override-saved-bindings)
+    (define-key input-decode-map (car entry) (cdr entry)))
+  (setq sis--prefix-override-saved-bindings nil))
+
+(defun sis--prefix-override-recap-do ()
+  "Recap prefix key override."
+  (sis--prefix-override-install t))
+
+(defun sis--prefix-override-recap-advice (fn &rest args)
+  "Advice for FN of `prefix-override-recap-triggers' with ARGS."
+  (unwind-protect (apply fn args)
+    (sis--prefix-override-recap-do)))
+
+(defun sis--respect-focus-change-advice ()
+  "Advice for `after-focus-change-function'."
+  (if (frame-focus-state)
+      (sis--respect-focus-in-handler)
+    (sis--respect-focus-out-handler)))
+
+(defun sis--respect-focus-out-handler ()
+  "Handler for `focus-out-hook'."
+  (let ((buffer (sis--respect-tracked-buffer)))
+    ;; `mouse-drag-region' causes lots of noise.
+    (unless (eq this-command 'mouse-drag-region)
+      ;; can't use `sis--save-to-buffer' directly
+      ;; because OS may has already changed input source
+      ;; when other windows get focus.
+      ;; so, don't get the current OS input source
+      (with-current-buffer buffer
+        (setq sis--for-buffer-locked t)
+        (sis--set-english)))
+
+    (when sis-log-mode
+      (with-current-buffer buffer
+        (message "Handle save hook, save [%s] to [%s]."
+                 sis--for-buffer buffer)))))
+
+(defun sis--respect-focus-in-handler ()
+  "Handler for `focus-in-hook'."
+  (let ((buffer (sis--respect-tracked-buffer)))
+    (when sis-log-mode
+      (with-current-buffer buffer
+        (message "Handle restore hook, restore [%s] from [%s] ."
+                 sis--for-buffer buffer)))
+    (sis--restore-from-buffer buffer)))
+
+(defun sis--respect-pre-command-handler ()
+  "Handler for `pre-command-hook' to preserve input source."
+  (setq sis--buffer-before-command (sis--respect-tracked-buffer))
+  (setq sis--real-this-command this-command)
   (when sis-log-mode
-    (message "timer@[%s]: [%s]@key [%s]@cmd [%s]@buf [%s]@override."
+    (message "pre@[%s]: [%s]@key [%s]@cmd [%s]@buf [%s]@override."
              sis--prefix-handle-stage
              (this-command-keys)
              sis--real-this-command
-             (current-buffer)
-             sis--prefix-override-map-enable))
+             sis--buffer-before-command
+             (sis--prefix-override-enabled-p sis--buffer-before-command))))
 
-  ;; determine input source
-  (cond
-   ;; go english, nothing need to do
-   (sis--respect-go-english
-    t)
-   ;; transient buffer shows
-   ((and (boundp 'transient--showp) transient--showp)
-    (setq sis--for-buffer-locked t)
-    (sis--set-english))
-   ;; restore
-   ((or sis--respect-force-restore
-        (not (eq sis--buffer-before-command (current-buffer))))
-    ;; entering minibuffer is handled separately.
-    ;; some functions like `exit-minibuffer' won't trigger post-command-hook
-    (unless (minibufferp)
-      (when sis-log-mode
-        (message "restore: [%s]@[%s]" sis--for-buffer (current-buffer)))
-      (sis--restore-from-buffer)
-      (setq sis--respect-force-restore nil))))
+(defun sis--respect-post-cmd-timer-fn ()
+  "Function for `sis--respect-post-cmd-timer'."
+  (let ((buffer (sis--respect-tracked-buffer)))
+    (when sis-log-mode
+      (message "timer@[%s]: [%s]@key [%s]@cmd [%s]@buf [%s]@override."
+               sis--prefix-handle-stage
+               (this-command-keys)
+               sis--real-this-command
+               buffer
+               (sis--prefix-override-enabled-p buffer)))
 
-  ;; disable prefix override for current buffer
-  (when (and (not (local-variable-p 'sis--prefix-override-map-enable))
-             (sis--prefix-override-buffer-disable-p))
-    (sis-prefix-override-buffer-disable))
-
-  ;; re-enable if prefix override is disabled temporarily
-  (unless (local-variable-p 'sis--prefix-override-map-enable)
-    (setq sis--prefix-override-map-enable t))
+    ;; determine input source
+    (cond
+     ;; go english, nothing need to do
+     (sis--respect-go-english
+      t)
+     ;; transient buffer shows
+     ((and (boundp 'transient--showp) transient--showp)
+      (with-current-buffer buffer
+        (setq sis--for-buffer-locked t)
+        (sis--set-english)))
+     ;; restore
+     ((or sis--respect-force-restore
+          (not (eq sis--buffer-before-command buffer)))
+      ;; entering minibuffer is handled separately.
+      ;; some functions like `exit-minibuffer' won't trigger post-command-hook
+      (unless (active-minibuffer-window)
+        (when sis-log-mode
+          (with-current-buffer buffer
+            (message "restore: [%s]@[%s]" sis--for-buffer buffer)))
+        (sis--restore-from-buffer buffer)
+        (setq sis--respect-force-restore nil)))))
 
   (setq sis--prefix-handle-stage 'normal)
   (setq sis--respect-post-cmd-timer nil))
@@ -968,28 +991,14 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
              (this-command-keys)
              sis--real-this-command
              (current-buffer)
-             sis--prefix-override-map-enable))
+             (sis--prefix-override-enabled-p (sis--respect-tracked-buffer))))
   (pcase sis--prefix-handle-stage
-    ;; current is prefix stage
-    ('prefix
-     (setq sis--prefix-handle-stage 'sequence))
     ;; current is sequence stage
     ('sequence
-     (cond
-      ;; still in progress
-      ((minibufferp)
-       (setq sis--prefix-handle-stage 'sequence))
-      ;; key sequence is canceled
-      ((not sis--real-this-command)
-       (when sis-log-mode (message "Key sequence canceled."))
-       (setq sis--respect-force-restore t)
-       (sis--to-normal-stage))
-
-      ;; end key sequence
-      (t
-       (when sis-log-mode (message "Key sequence ended."))
-       (setq sis--respect-force-restore t)
-       (sis--to-normal-stage))))
+     (when sis-log-mode
+       (message "Key sequence ended."))
+     (setq sis--respect-force-restore t)
+     (sis--to-normal-stage))
     ;; current is normal stage
     ('normal
      (sis--to-normal-stage))))
@@ -1042,7 +1051,7 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
 - Respect ~evil~: switch to English when leaving ~evil~ ~insert~ mode.
 - Respect prefix key: switch to English for \\[Control-c] / \\[Control-x] /
   \\[Control-h].
-- Respect buffer: restore buffer input source when it regain focus."
+  - Respect buffer: restore buffer input source when it regain focus."
   :global t
   :init-value nil
   (cond
@@ -1077,18 +1086,8 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
          ;; Don't use :filter-return, advice may not run when trigger has error.
          (advice-add trigger :around #'sis--respect-restore-advice))
 
-       ;; set english when prefix key pressed
-       (setq sis--prefix-override-map-alist
-             `((sis--prefix-override-map-enable
-                .
-                ,(let ((keymap (make-sparse-keymap)))
-                   (dolist (prefix sis-prefix-override-keys)
-                     (define-key keymap
-                                 (kbd prefix) #'sis--prefix-override-handler))
-                   keymap))))
-
        (setq sis--prefix-override-map-enable t)
-       (sis--prefix-override-recap-do)
+       (sis--prefix-override-install)
        (dolist (trigger sis-prefix-override-recap-triggers)
          (advice-add trigger :around
                      #'sis--prefix-override-recap-advice)))))
@@ -1121,9 +1120,7 @@ Possible values: \\='normal, \\='prefix, \\='sequence.")
       (advice-remove trigger #'sis--respect-restore-advice))
 
     ;; for prefix key
-    (setq emulation-mode-map-alists
-          (delq 'sis--prefix-override-map-alist
-                emulation-mode-map-alists))
+    (sis--prefix-override-uninstall)
     (setq sis--prefix-override-map-enable nil)
     (dolist (trigger sis-prefix-override-recap-triggers)
       (advice-remove trigger #'sis--prefix-override-recap-advice)))))
